@@ -322,6 +322,7 @@ fluid_voice_init(fluid_voice_t *voice, fluid_sample_t *sample,
     voice->mod_count = 0;
     voice->start_time = start_time;
     voice->has_noteoff = 0;
+    voice->note_pitch_bend = 0.0f;
     voice->callback = NULL;
     voice->callback_data = NULL;
     UPDATE_RVOICE0(fluid_rvoice_reset);
@@ -519,6 +520,21 @@ void
 fluid_voice_calculate_gen_pitch(fluid_voice_t *voice)
 {
     voice->gen[GEN_PITCH].val = fluid_voice_calculate_pitch(voice, fluid_voice_get_actual_key(voice));
+}
+
+/*
+ * fluid_voice_set_note_pitch_bend
+ *
+ * Sets the MIDI 2.0 per-note pitch bend of this voice (in cents) and
+ * recalculates the voice pitch. The per-note bend is stacked on top of the
+ * channel-wide pitch bend (which enters through the GEN_FINETUNE modulators),
+ * so both apply independently.
+ */
+void
+fluid_voice_set_note_pitch_bend(fluid_voice_t *voice, fluid_real_t cents)
+{
+    voice->note_pitch_bend = cents;
+    fluid_voice_update_param(voice, GEN_PITCH);
 }
 
 /*
@@ -804,9 +820,13 @@ fluid_voice_update_param(fluid_voice_t *voice, int gen)
     case GEN_COARSETUNE:
     case GEN_FINETUNE:
         /* The testing for allowed range is done in 'fluid_ct2hz' */
+        /* The channel-wide pitch bend enters through the GEN_FINETUNE
+         * modulators. The MIDI 2.0 per-note pitch bend is stacked on top
+         * of it, so that both bends apply independently. */
         voice->pitch = (fluid_voice_gen_value(voice, GEN_PITCH)
                         + 100.0f * fluid_voice_gen_value(voice, GEN_COARSETUNE)
-                        + fluid_voice_gen_value(voice, GEN_FINETUNE));
+                        + fluid_voice_gen_value(voice, GEN_FINETUNE)
+                        + voice->note_pitch_bend);
         UPDATE_RVOICE_R1(fluid_rvoice_set_pitch, voice->pitch);
         break;
 

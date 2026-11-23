@@ -84,6 +84,8 @@ struct _fluid_voice_t
     fluid_real_t pitch;              /* the pitch in midicents (dupe in rvoice) */
     fluid_real_t attenuation;        /* the attenuation in centibels (dupe in rvoice) */
     fluid_real_t root_key;           /* the effective root key of the sample in absolute cents */
+    fluid_real_t note_pitch_bend;    /* MIDI 2.0 per-note pitch bend in cents, applied
+                                        on top of the channel-wide pitch bend */
 
     /* master gain (dupe in rvoice) */
     fluid_real_t synth_gain;
@@ -129,6 +131,7 @@ void delete_fluid_voice(fluid_voice_t *voice);
 
 void fluid_voice_start(fluid_voice_t *voice);
 void  fluid_voice_calculate_gen_pitch(fluid_voice_t *voice);
+void fluid_voice_set_note_pitch_bend(fluid_voice_t *voice, fluid_real_t cents);
 
 int fluid_voice_init(fluid_voice_t *voice, fluid_sample_t *sample,
                      fluid_zone_range_t *inst_zone_range,

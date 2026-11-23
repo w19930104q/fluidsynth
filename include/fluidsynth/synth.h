@@ -74,6 +74,7 @@ FLUIDSYNTH_API int fluid_synth_sysex(fluid_synth_t *synth, const char *data, int
                                      char *response, int *response_len, int *handled, int dryrun);
 FLUIDSYNTH_API int fluid_synth_pitch_bend(fluid_synth_t *synth, int chan, int val);
 FLUIDSYNTH_API int fluid_synth_get_pitch_bend(fluid_synth_t *synth, int chan, int *ppitch_bend);
+FLUIDSYNTH_API int fluid_synth_note_pitch_bend(fluid_synth_t *synth, int chan, int key, float cents);
 FLUIDSYNTH_API int fluid_synth_pitch_wheel_sens(fluid_synth_t *synth, int chan, int val);
 FLUIDSYNTH_API int fluid_synth_get_pitch_wheel_sens(fluid_synth_t *synth, int chan, int *pval);
 FLUIDSYNTH_API int fluid_synth_program_change(fluid_synth_t *synth, int chan, int program);
@@ -595,6 +596,9 @@ FLUIDSYNTH_API fluid_preset_t *fluid_synth_get_channel_preset(fluid_synth_t *syn
 
 /** @ingroup midi_input */
 FLUIDSYNTH_API int fluid_synth_handle_midi_event(void *data, fluid_midi_event_t *event);
+
+/** @ingroup midi_input */
+FLUIDSYNTH_API int fluid_synth_handle_ump(void *data, unsigned int word0, unsigned int word1);
 
 /** @ingroup soundfonts */
 FLUIDSYNTH_API

@@ -3238,6 +3238,52 @@ fluid_synth_get_pitch_bend(fluid_synth_t *synth, int chan, int *ppitch_bend)
 }
 
 /**
+ * Set a per-note pitch bend on all currently active voices of a given note.
+ *
+ * This implements the MIDI 2.0 Per-Note Pitch Bend message: contrary to
+ * fluid_synth_pitch_bend(), which bends all notes of a channel, the per-note
+ * pitch bend only affects the voices currently playing the given key on the
+ * given channel. It is applied on top of (i.e. in addition to) the
+ * channel-wide pitch bend.
+ * @param synth FluidSynth instance
+ * @param chan MIDI channel number (0 to MIDI channel count - 1)
+ * @param key MIDI note number (0-127)
+ * @param cents Pitch bend in cents (0.0f for no bend); the MIDI 2.0 Per-Note
+ *   Pitch Bend message has a fixed range of +/- 96 semitones
+ * @return #FLUID_OK on success, #FLUID_FAILED otherwise
+ * @since 2.7.0
+ */
+int
+fluid_synth_note_pitch_bend(fluid_synth_t *synth, int chan, int key, float cents)
+{
+    fluid_voice_t *voice;
+    int i;
+
+    fluid_return_val_if_fail(key >= 0 && key <= 127, FLUID_FAILED);
+    FLUID_API_ENTRY_CHAN(FLUID_FAILED);
+
+    /* Allowed only on MIDI channel enabled */
+    FLUID_API_RETURN_IF_CHAN_DISABLED(FLUID_FAILED);
+
+    if(synth->verbose)
+    {
+        FLUID_LOG(FLUID_INFO, "notepitchb\t%d\t%d\t%.2f", chan, key, cents);
+    }
+
+    for(i = 0; i < synth->polyphony; i++)
+    {
+        voice = synth->voice[i];
+
+        if(fluid_voice_is_on(voice) && voice->chan == chan && voice->key == key)
+        {
+            fluid_voice_set_note_pitch_bend(voice, cents);
+        }
+    }
+
+    FLUID_API_RETURN(FLUID_OK);
+}
+
+/**
  * Set MIDI pitch wheel sensitivity on a MIDI channel.
  * @param synth FluidSynth instance
  * @param chan MIDI channel number (0 to MIDI channel count - 1)
@@ -5433,6 +5479,11 @@ fluid_synth_alloc_voice_LOCAL(fluid_synth_t *synth, fluid_sample_t *sample, int 
         FLUID_LOG(FLUID_WARN, "Failed to initialize voice");
         return NULL;
     }
+
+    /* Apply a pending MIDI 2.0 per-note pitch bend (in cents) to the new
+     * voice. It is stacked on top of the channel-wide pitch bend when the
+     * voice's pitch is calculated in fluid_synth_start_voice(). */
+    voice->note_pitch_bend = synth->note_pitch_bend;
 
     /* add the default modulators to the synthesis process. */
     /* custom_breath2att_modulator is not a default modulator specified in SF
@@ -8101,6 +8152,233 @@ fluid_synth_handle_midi_event(void *data, fluid_midi_event_t *event)
     }
 
     return FLUID_FAILED;
+}
+
+/* UMP message types (Universal MIDI Packet, M2-104-UM) */
+enum fluid_ump_message_type
+{
+    UMP_MT_MIDI1_CHANNEL_VOICE = 0x2,  /* MIDI 1.0 Channel Voice Message (32 bit) */
+    UMP_MT_MIDI2_CHANNEL_VOICE = 0x4   /* MIDI 2.0 Channel Voice Message (64 bit) */
+};
+
+/* MIDI 2.0 Channel Voice status nibbles (in addition to the MIDI 1.0 ones) */
+enum fluid_ump_midi2_status
+{
+    UMP_STATUS_REGISTERED_PER_NOTE_CTRL = 0x00,
+    UMP_STATUS_ASSIGNABLE_PER_NOTE_CTRL = 0x10,
+    UMP_STATUS_PER_NOTE_PITCH_BEND      = 0x60,
+    UMP_STATUS_PER_NOTE_MANAGEMENT      = 0xF0
+};
+
+/* MIDI 2.0 Note-On attribute types */
+enum fluid_ump_note_attribute_type
+{
+    UMP_NOTE_ATTRIBUTE_NONE        = 0x00,
+    UMP_NOTE_ATTRIBUTE_MANUFACTURER = 0x01,
+    UMP_NOTE_ATTRIBUTE_PROFILE     = 0x02,
+    UMP_NOTE_ATTRIBUTE_PITCH_7_9   = 0x03
+};
+
+/* The MIDI 2.0 Per-Note Pitch Bend message has a fixed range of +/- 96 semitones */
+#define UMP_PER_NOTE_PITCH_BEND_RANGE_CENTS 9600.0f
+/* Neutral value of a 32 bit MIDI 2.0 pitch bend */
+#define UMP_PITCH_BEND_CENTER 0x80000000u
+
+/* Convert a 32 bit MIDI 2.0 controller/data value to 7 bit */
+static FLUID_INLINE int
+fluid_ump_data32_to_7bit(unsigned int val)
+{
+    return (int)(val >> 25);
+}
+
+/* Convert a 16 bit MIDI 2.0 velocity to 7 bit (never maps a non-zero
+ * velocity to zero) */
+static FLUID_INLINE int
+fluid_ump_vel16_to_7bit(unsigned int vel)
+{
+    int vel7 = (int)(vel >> 9);
+
+    if(vel != 0 && vel7 == 0)
+    {
+        vel7 = 1;
+    }
+
+    return vel7;
+}
+
+/* Handles a MIDI 1.0 Channel Voice Message carried in a 32 bit UMP (message
+ * type 0x2). The message behaves exactly like a legacy MIDI 1.0 input, in
+ * particular pitch bend remains channel-wide. */
+static int
+fluid_synth_handle_ump_midi1(fluid_synth_t *synth, unsigned int word0)
+{
+    int type = (word0 >> 16) & 0xF0;
+    int chan = (word0 >> 16) & 0x0F;
+    int data1 = (word0 >> 8) & 0x7F;
+    int data2 = word0 & 0x7F;
+
+    switch(type)
+    {
+    case NOTE_ON:
+        return fluid_synth_noteon(synth, chan, data1, data2);
+
+    case NOTE_OFF:
+        return fluid_synth_noteoff(synth, chan, data1);
+
+    case CONTROL_CHANGE:
+        return fluid_synth_cc(synth, chan, data1, data2);
+
+    case PROGRAM_CHANGE:
+        return fluid_synth_program_change(synth, chan, data1);
+
+    case CHANNEL_PRESSURE:
+        return fluid_synth_channel_pressure(synth, chan, data1);
+
+    case KEY_PRESSURE:
+        return fluid_synth_key_pressure(synth, chan, data1, data2);
+
+    case PITCH_BEND:
+        return fluid_synth_pitch_bend(synth, chan, (data2 << 7) | data1);
+    }
+
+    return FLUID_FAILED;
+}
+
+/* Handles a MIDI 2.0 Channel Voice Message carried in a 64 bit UMP (message
+ * type 0x4). */
+static int
+fluid_synth_handle_ump_midi2(fluid_synth_t *synth, unsigned int word0, unsigned int word1)
+{
+    int status = (word0 >> 16) & 0xF0;
+    int chan = (word0 >> 16) & 0x0F;
+    int index = (word0 >> 8) & 0xFF; /* note number or controller number */
+    int result;
+
+    switch(status)
+    {
+    case NOTE_ON:
+    {
+        int attr_type = word0 & 0xFF;
+        int vel = fluid_ump_vel16_to_7bit((word1 >> 16) & 0xFFFF);
+        fluid_real_t note_pitch_bend = 0.0f;
+
+        /* Note-On attribute "Pitch 7.9": the note is played at the given
+         * absolute pitch (7.9 fixed point semitones) instead of the nominal
+         * pitch of the note number. Expressed as a per-note pitch bend
+         * relative to the note number. */
+        if(attr_type == UMP_NOTE_ATTRIBUTE_PITCH_7_9)
+        {
+            unsigned int pitch_7_9 = word1 & 0xFFFF;
+            note_pitch_bend = ((fluid_real_t)pitch_7_9 / 512.0f - index) * 100.0f;
+        }
+
+        /* The transient per-note pitch bend is picked up by
+         * fluid_synth_alloc_voice_LOCAL() for every voice created by this
+         * note-on. The synth mutex is held recursively during this call, so
+         * no other note-on can interleave. */
+        synth->note_pitch_bend = note_pitch_bend;
+        result = fluid_synth_noteon(synth, chan, index, vel);
+        synth->note_pitch_bend = 0.0f;
+
+        return result;
+    }
+
+    case NOTE_OFF:
+        return fluid_synth_noteoff(synth, chan, index);
+
+    case KEY_PRESSURE:
+        return fluid_synth_key_pressure(synth, chan, index,
+                                        fluid_ump_data32_to_7bit(word1));
+
+    case CONTROL_CHANGE:
+        return fluid_synth_cc(synth, chan, index & 0x7F,
+                              fluid_ump_data32_to_7bit(word1));
+
+    case PROGRAM_CHANGE:
+        if(word1 & 0x1) /* Bank Valid flag: word1 bits 23:16 = MSB, 15:8 = LSB */
+        {
+            int bank = (((word1 >> 16) & 0x7F) << 7) | ((word1 >> 8) & 0x7F);
+            result = fluid_synth_bank_select(synth, chan, bank);
+
+            if(result != FLUID_OK)
+            {
+                return result;
+            }
+        }
+
+        return fluid_synth_program_change(synth, chan, index & 0x7F);
+
+    case CHANNEL_PRESSURE:
+        return fluid_synth_channel_pressure(synth, chan,
+                                            fluid_ump_data32_to_7bit(word1));
+
+    case PITCH_BEND:
+        /* 32 bit channel pitch bend, 0x80000000 is center. The bend range is
+         * given by the channel's pitch wheel sensitivity, as in MIDI 1.0. */
+        return fluid_synth_pitch_bend(synth, chan, (int)((word1 >> 18) & 0x3FFF));
+
+    case UMP_STATUS_PER_NOTE_PITCH_BEND:
+    {
+        /* 32 bit per-note pitch bend with a fixed range of +/- 96 semitones,
+         * 0x80000000 is center. */
+        double cents = ((double)word1 - (double)UMP_PITCH_BEND_CENTER)
+                       / (double)UMP_PITCH_BEND_CENTER
+                       * UMP_PER_NOTE_PITCH_BEND_RANGE_CENTS;
+        return fluid_synth_note_pitch_bend(synth, chan, index, (float)cents);
+    }
+
+    case UMP_STATUS_REGISTERED_PER_NOTE_CTRL:
+    case UMP_STATUS_ASSIGNABLE_PER_NOTE_CTRL:
+    case UMP_STATUS_PER_NOTE_MANAGEMENT:
+        /* not implemented */
+        return FLUID_FAILED;
+    }
+
+    return FLUID_FAILED;
+}
+
+/**
+ * Handle a Universal MIDI Packet (UMP), used as a callback function.
+ *
+ * This is the MIDI 2.0 counterpart of fluid_synth_handle_midi_event(). It
+ * currently supports 32 bit MIDI 1.0 Channel Voice messages (which behave
+ * exactly like their legacy MIDI 1.0 counterparts) and 64 bit MIDI 2.0
+ * Channel Voice messages, including the MIDI 2.0 Per-Note Pitch Bend message
+ * and the Note-On "Pitch 7.9" attribute, both of which bend a single note
+ * independently of the channel-wide pitch bend.
+ * @param data FluidSynth instance
+ * @param word0 The first 32 bit word of the UMP
+ * @param word1 The second 32 bit word of the UMP (only used by 64 bit
+ *   messages, pass 0 for 32 bit messages)
+ * @return #FLUID_OK on success, #FLUID_FAILED otherwise
+ * @since 2.7.0
+ */
+int
+fluid_synth_handle_ump(void *data, unsigned int word0, unsigned int word1)
+{
+    fluid_synth_t *synth = (fluid_synth_t *) data;
+    int message_type;
+
+    fluid_return_val_if_fail(synth != NULL, FLUID_FAILED);
+
+    message_type = (int)((word0 >> 28) & 0x0F);
+
+    /* Lock the synth for the whole message handling, so that e.g. the
+     * transient per-note pitch bend of a MIDI 2.0 note-on cannot interleave
+     * with another note-on. The mutex is recursive, the subroutines below
+     * will simply lock it again. */
+    fluid_synth_api_enter(synth);
+
+    switch(message_type)
+    {
+    case UMP_MT_MIDI1_CHANNEL_VOICE:
+        FLUID_API_RETURN(fluid_synth_handle_ump_midi1(synth, word0));
+
+    case UMP_MT_MIDI2_CHANNEL_VOICE:
+        FLUID_API_RETURN(fluid_synth_handle_ump_midi2(synth, word0, word1));
+    }
+
+    FLUID_API_RETURN(FLUID_FAILED);
 }
 
 /**
