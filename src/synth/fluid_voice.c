@@ -321,6 +321,7 @@ fluid_voice_init(fluid_voice_t *voice, fluid_sample_t *sample,
     voice->channel = channel;
     voice->mod_count = 0;
     voice->start_time = start_time;
+    voice->attack_end_ticks = 0;
     voice->has_noteoff = 0;
     voice->callback = NULL;
     voice->callback_data = NULL;
@@ -442,6 +443,37 @@ fluid_real_t fluid_voice_gen_value(const fluid_voice_t *voice, int num)
 }
 
 /*
+ * Compute the tick at which the volume envelope leaves its attack stage.
+ * Mirrors the block-aligned timing used by fluid_voice_update_param()
+ * (see NUM_BUFFERS_*): the synth clock advances FLUID_BUFSIZE samples per
+ * rendered block, so delay and attack are rounded up to whole blocks.
+ *
+ * Only voice-owned fields are read; safe to evaluate in the synthesis thread
+ * while the rvoice is being rendered.
+ */
+static unsigned int
+fluid_voice_calc_attack_end_ticks(fluid_voice_t *voice)
+{
+    double delay_sec = fluid_tc2sec_delay(fluid_voice_gen_value(voice, GEN_VOLENVDELAY));
+    double attack_sec = fluid_tc2sec_attack(fluid_voice_gen_value(voice, GEN_VOLENVATTACK));
+    double total_sec = delay_sec + attack_sec;
+    unsigned int blocks;
+
+    if(total_sec <= 0.0)
+    {
+        return voice->start_time;
+    }
+
+    /* Round the delay+attack duration up to whole render blocks, exactly as
+     * the ADSR setup does (count = 1 + NUM_BUFFERS_*). */
+    blocks = 1u
+             + (unsigned int)(voice->output_rate * delay_sec / FLUID_BUFSIZE)
+             + (unsigned int)(voice->output_rate * attack_sec / FLUID_BUFSIZE);
+
+    return voice->start_time + blocks * FLUID_BUFSIZE;
+}
+
+/*
  * fluid_voice_start
  */
 void fluid_voice_start(fluid_voice_t *voice)
@@ -451,6 +483,10 @@ void fluid_voice_start(fluid_voice_t *voice)
      * for the first time.*/
 
     fluid_voice_calculate_runtime_synthesis_parameters(voice);
+
+    /* Cache the end of the attack stage for the overflow (voice stealing)
+     * logic, which must not touch the rvoice. */
+    voice->attack_end_ticks = fluid_voice_calc_attack_end_ticks(voice);
 
 #ifdef WITH_PROFILING
     voice->ref = fluid_profile_ref();
@@ -2042,14 +2078,14 @@ fluid_voice_get_overflow_prio(fluid_voice_t *voice,
      * chord. So give newer voices a higher score. */
     if(score->age)
     {
-        cur_time -= voice->start_time;
+        unsigned int voice_age = cur_time - voice->start_time;
 
-        if(cur_time < 1)
+        if(voice_age < 1)
         {
-            cur_time = 1; // Avoid div by zero
+            voice_age = 1; // Avoid div by zero
         }
 
-        this_voice_prio += (score->age * voice->output_rate) / cur_time;
+        this_voice_prio += (score->age * voice->output_rate) / voice_age;
     }
 
     /* take a rough estimate of loudness into account. Louder voices are more important. */
@@ -2070,6 +2106,27 @@ fluid_voice_get_overflow_prio(fluid_voice_t *voice,
         this_voice_prio += score->volume / a;
     }
 
+    /* Weight the note-on velocity: loudly played notes carry more musical
+     * weight than quiet ones and should survive voice exhaustion longer. */
+    if(score->velocity)
+    {
+        this_voice_prio += score->velocity * (voice->vel / 127.0f);
+    }
+
+    /* Protect voices whose volume envelope is still in the attack stage:
+     * cutting an attacking note produces an audible pop because the onset
+     * ramp is aborted. The protection fades out linearly towards the end of
+     * the attack, so among several attacking voices the one furthest into its
+     * onset (and thus closest to silence at the cut point) is preferred for
+     * stealing. */
+    if(score->attack && fluid_voice_is_in_attack(voice, cur_time))
+    {
+        unsigned int attack_duration = fluid_voice_get_attack_duration_ticks(voice);
+        unsigned int elapsed = cur_time - voice->start_time;
+
+        this_voice_prio += score->attack * ((float)elapsed / attack_duration);
+    }
+
     /* Check if this voice is on an important channel. If so, then add the
      * score for important channels */
     channel = fluid_voice_get_channel(voice);
@@ -2080,6 +2137,44 @@ fluid_voice_get_overflow_prio(fluid_voice_t *voice,
     }
 
     return this_voice_prio;
+}
+
+/* Only touches voice-owned fields, hence it is safe to call while the rvoice
+ * is locked and rendered in a separate thread. */
+int
+fluid_voice_is_in_attack(fluid_voice_t *voice, unsigned int cur_time)
+{
+    /* No cached attack window (not started yet): nothing to protect. */
+    if(voice->status == FLUID_VOICE_CLEAN || voice->attack_end_ticks == 0)
+    {
+        return 0;
+    }
+
+    /* A released voice has left the attack section by definition. */
+    if(voice->has_noteoff || voice->status == FLUID_VOICE_OFF)
+    {
+        return 0;
+    }
+
+    /* Guard against clocks that have not reached the voice start tick. */
+    if(voice->start_time >= voice->attack_end_ticks
+            || cur_time <= voice->start_time)
+    {
+        return 0;
+    }
+
+    return cur_time < voice->attack_end_ticks;
+}
+
+unsigned int
+fluid_voice_get_attack_duration_ticks(fluid_voice_t *voice)
+{
+    if(voice->start_time >= voice->attack_end_ticks)
+    {
+        return 0;
+    }
+
+    return voice->attack_end_ticks - voice->start_time;
 }
 
 

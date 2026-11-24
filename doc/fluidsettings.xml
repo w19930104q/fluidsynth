@@ -292,6 +292,36 @@ Developers:
             </desc>
         </setting>
         <setting>
+            <name>overflow.velocity</name>
+            <type>num</type>
+            <def>2000.0</def>
+            <min>-10000.0</min>
+            <max>10000.0</max>
+            <realtime/>
+            <desc>
+                This score is weighted by the normalized note-on velocity (a value
+                between 0 and 1) and added to the overflow priority. With a positive
+                value, loudly played notes get a higher priority and survive voice
+                exhaustion longer than quietly played notes. Set it to 0 to disable
+                velocity weighting.
+            </desc>
+        </setting>
+        <setting>
+            <name>overflow.attack</name>
+            <type>num</type>
+            <def>8000.0</def>
+            <min>-10000.0</min>
+            <max>10000.0</max>
+            <realtime/>
+            <desc>
+                This score protects voices whose volume envelope is still in its
+                attack stage, because cutting an attacking note produces an audible
+                pop. The protection fades out linearly towards the end of the attack,
+                so among several attacking voices the one furthest into its onset is
+                preferred for stealing. Set it to 0 to disable attack protection.
+            </desc>
+        </setting>
+        <setting>
             <name>overflow.important</name>
             <type>num</type>
             <def>5000.0</def>

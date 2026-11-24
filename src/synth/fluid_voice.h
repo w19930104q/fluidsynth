@@ -45,6 +45,8 @@ struct _fluid_overflow_prio_t
     float sustained; /**< Is this voice sustained? Then add this score (usually negative) */
     float volume; /**< Multiply current (or future) volume (a value between 0 and 1) */
     float age; /**< This score will be divided by the number of seconds the voice has lasted */
+    float velocity; /**< Score weight of the note-on velocity (between 0 and 1) */
+    float attack; /**< Score weight added while the volume envelope is still in attack */
     float important; /**< This score will be added to all important channels */
     char *important_channels; /**< "important" flags indexed by MIDI channel number */
     int num_important_channels; /**< Number of elements in the important_channels array */
@@ -75,6 +77,8 @@ struct _fluid_voice_t
     unsigned int id;                /* the id is incremented for every new noteon.
 					   it's used for noteoff's  */
     unsigned int start_time;
+    unsigned int attack_end_ticks;  /* Tick at which the volume envelope leaves its
+					attack stage; 0 until computed in fluid_voice_start() */
     fluid_channel_t *channel;
 
     /* basic parameters */
@@ -172,6 +176,24 @@ int fluid_voice_kill_excl(fluid_voice_t *voice);
 float fluid_voice_get_overflow_prio(fluid_voice_t *voice,
                                     fluid_overflow_prio_t *score,
                                     unsigned int cur_time);
+
+/**
+ * Check whether a voice's volume envelope is still in its attack stage.
+ *
+ * Uses only voice-owned fields (no rvoice access), so it is safe to call
+ * from the synthesis thread while the rvoice is being rendered.
+ *
+ * @param voice the voice to test
+ * @param cur_time current tick as returned by fluid_synth_get_ticks()
+ * @return 1 while the envelope is in attack, 0 otherwise
+ */
+int fluid_voice_is_in_attack(fluid_voice_t *voice, unsigned int cur_time);
+
+/**
+ * Number of ticks a voice's volume envelope spends in its attack stage.
+ * @return attack duration in ticks, or 0 when the attack has already elapsed
+ */
+unsigned int fluid_voice_get_attack_duration_ticks(fluid_voice_t *voice);
 
 #define OVERFLOW_PRIO_CANNOT_KILL 999999.
 

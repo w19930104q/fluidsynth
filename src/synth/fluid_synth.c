@@ -106,7 +106,7 @@ static void fluid_synth_update_presets(fluid_synth_t *synth);
 static void fluid_synth_update_gain_LOCAL(fluid_synth_t *synth);
 static int fluid_synth_update_polyphony_LOCAL(fluid_synth_t *synth, int new_polyphony);
 
-static fluid_voice_t *fluid_synth_free_voice_by_kill_LOCAL(fluid_synth_t *synth);
+static fluid_voice_t *fluid_synth_free_voice_by_kill_LOCAL(fluid_synth_t *synth, int chan, int key);
 static void fluid_synth_kill_by_exclusive_class_LOCAL(fluid_synth_t *synth,
         fluid_voice_t *new_voice);
 static int fluid_synth_sfunload_callback(void *data, unsigned int msec);
@@ -272,6 +272,8 @@ void fluid_synth_settings(fluid_settings_t *settings)
     fluid_settings_register_num(settings, "synth.overflow.released", -2000, -10000, 10000, 0);
     fluid_settings_register_num(settings, "synth.overflow.age", 1000, -10000, 10000, 0);
     fluid_settings_register_num(settings, "synth.overflow.volume", 500, -10000, 10000, 0);
+    fluid_settings_register_num(settings, "synth.overflow.velocity", 2000, -10000, 10000, 0);
+    fluid_settings_register_num(settings, "synth.overflow.attack", 8000, -10000, 10000, 0);
     fluid_settings_register_num(settings, "synth.overflow.important", 5000, -50000, 50000, 0);
     fluid_settings_register_str(settings, "synth.overflow.important-channels", "", 0);
 
@@ -807,6 +809,8 @@ new_fluid_synth(fluid_settings_t *settings)
     fluid_settings_getnum_float(settings, "synth.overflow.sustained", &synth->overflow.sustained);
     fluid_settings_getnum_float(settings, "synth.overflow.volume", &synth->overflow.volume);
     fluid_settings_getnum_float(settings, "synth.overflow.age", &synth->overflow.age);
+    fluid_settings_getnum_float(settings, "synth.overflow.velocity", &synth->overflow.velocity);
+    fluid_settings_getnum_float(settings, "synth.overflow.attack", &synth->overflow.attack);
     fluid_settings_getnum_float(settings, "synth.overflow.important", &synth->overflow.important);
 
     fluid_settings_getint(settings, "synth.note-cut", &i);
@@ -828,6 +832,10 @@ new_fluid_synth(fluid_settings_t *settings)
     fluid_settings_callback_num(settings, "synth.overflow.age",
                                 fluid_synth_handle_overflow, synth);
     fluid_settings_callback_num(settings, "synth.overflow.volume",
+                                fluid_synth_handle_overflow, synth);
+    fluid_settings_callback_num(settings, "synth.overflow.velocity",
+                                fluid_synth_handle_overflow, synth);
+    fluid_settings_callback_num(settings, "synth.overflow.attack",
                                 fluid_synth_handle_overflow, synth);
     fluid_settings_callback_num(settings, "synth.overflow.important",
                                 fluid_synth_handle_overflow, synth);
@@ -1242,6 +1250,10 @@ delete_fluid_synth(fluid_synth_t *synth)
     fluid_settings_callback_num(synth->settings, "synth.overflow.age",
                                 NULL, NULL);
     fluid_settings_callback_num(synth->settings, "synth.overflow.volume",
+                                NULL, NULL);
+    fluid_settings_callback_num(synth->settings, "synth.overflow.velocity",
+                                NULL, NULL);
+    fluid_settings_callback_num(synth->settings, "synth.overflow.attack",
                                 NULL, NULL);
     fluid_settings_callback_num(synth->settings, "synth.overflow.important",
                                 NULL, NULL);
@@ -5302,6 +5314,14 @@ static void fluid_synth_handle_overflow(void *data, const char *name, double val
     {
         synth->overflow.age = value;
     }
+    else if(FLUID_STRCMP(name, "synth.overflow.velocity") == 0)
+    {
+        synth->overflow.velocity = value;
+    }
+    else if(FLUID_STRCMP(name, "synth.overflow.attack") == 0)
+    {
+        synth->overflow.attack = value;
+    }
     else if(FLUID_STRCMP(name, "synth.overflow.important") == 0)
     {
         synth->overflow.important = value;
@@ -5310,50 +5330,111 @@ static void fluid_synth_handle_overflow(void *data, const char *name, double val
     fluid_synth_api_exit(synth);
 }
 
-/* Selects a voice for killing. */
+/*
+ * Voice stealing tiers, from most to least preferred victim.
+ *
+ * A retrigger of the very same note (channel + key) should replace the old
+ * voice of that note rather than stealing a different note, hence the two
+ * "same note" tiers come first. Within either group, voices whose volume
+ * envelope has left the attack stage are preferred, because cutting an
+ * attacking note causes an audible pop.
+ */
+enum
+{
+    KILL_SAME_NOTE_POST_ATTACK = 0,
+    KILL_SAME_NOTE_IN_ATTACK,
+    KILL_OTHER_NOTE_POST_ATTACK,
+    KILL_OTHER_NOTE_IN_ATTACK,
+    KILL_TIER_COUNT
+};
+
+/* Selects a voice for killing.
+ *
+ * The pool of fixed-size, preallocated voices is never grown: callers either
+ * receive an unused slot or one existing voice is stopped and its slot is
+ * recycled, so the active voice count can never exceed synth->polyphony.
+ *
+ * @param chan channel of the note-on that needs a voice (-1 to disable the
+ *             same-note retrigger preference)
+ * @param key  MIDI key of that note-on
+ */
 static fluid_voice_t *
-fluid_synth_free_voice_by_kill_LOCAL(fluid_synth_t *synth)
+fluid_synth_free_voice_by_kill_LOCAL(fluid_synth_t *synth, int chan, int key)
 {
     int i;
-    float best_prio = OVERFLOW_PRIO_CANNOT_KILL - 1;
-    float this_voice_prio;
+    float best_prio[KILL_TIER_COUNT];
+    int best_voice_index[KILL_TIER_COUNT];
     fluid_voice_t *voice;
-    int best_voice_index = -1;
+    int tier;
     unsigned int ticks = fluid_synth_get_ticks(synth);
+
+    for(tier = 0; tier < KILL_TIER_COUNT; tier++)
+    {
+        best_prio[tier] = OVERFLOW_PRIO_CANNOT_KILL - 1;
+        best_voice_index[tier] = -1;
+    }
 
     for(i = 0; i < synth->polyphony; i++)
     {
+        int this_tier;
+        float this_voice_prio;
+
         voice = synth->voice[i];
 
-        /* safeguard against an available voice. */
+        /* Reuse an available (clean/stopped and accessible) slot directly. */
         if(_AVAILABLE(voice))
         {
             return voice;
         }
 
+        /* Voices locked for overflow rendering and any other unkillable
+         * candidate are skipped. */
         this_voice_prio = fluid_voice_get_overflow_prio(voice, &synth->overflow,
                           ticks);
 
-        /* check if this voice has less priority than the previous candidate. */
-        if(this_voice_prio < best_prio)
+        if(this_voice_prio >= OVERFLOW_PRIO_CANNOT_KILL)
         {
-            best_voice_index = i;
-            best_prio = this_voice_prio;
+            continue;
+        }
+
+        /* Classify into one of the four stealing tiers. */
+        this_tier = (chan >= 0
+                     && fluid_voice_get_channel(voice) == chan
+                     && fluid_voice_get_key(voice) == key) ? 0 : 2;
+
+        if(fluid_voice_is_in_attack(voice, ticks))
+        {
+            this_tier++;
+        }
+
+        /* Keep the lowest-scoring (most expendable) voice per tier. */
+        if(this_voice_prio < best_prio[this_tier])
+        {
+            best_prio[this_tier] = this_voice_prio;
+            best_voice_index[this_tier] = i;
         }
     }
 
-    if(best_voice_index < 0)
+    /* Pick the first tier that produced a candidate. */
+    for(tier = 0; tier < KILL_TIER_COUNT; tier++)
     {
-        FLUID_LOG(FLUID_DBG, "Polyphony exceeded, failed to find a suitable voice to kill");
-        return NULL;
+        if(best_voice_index[tier] >= 0)
+        {
+            i = best_voice_index[tier];
+            voice = synth->voice[i];
+            FLUID_LOG(FLUID_DBG,
+                      "Polyphony exceeded, killing voice %d, index %d, chan %d, key %d (tier %d)%s",
+                      fluid_voice_get_id(voice), i,
+                      fluid_voice_get_channel(voice), fluid_voice_get_key(voice),
+                      tier, tier <= KILL_SAME_NOTE_IN_ATTACK ? " (retrigger)" : "");
+            fluid_voice_off(voice);
+
+            return voice;
+        }
     }
 
-    voice = synth->voice[best_voice_index];
-    FLUID_LOG(FLUID_DBG, "Polyphony exceeded, killing voice %d, index %d, chan %d, key %d ",
-              fluid_voice_get_id(voice), best_voice_index, fluid_voice_get_channel(voice), fluid_voice_get_key(voice));
-    fluid_voice_off(voice);
-
-    return voice;
+    FLUID_LOG(FLUID_DBG, "Polyphony exceeded, failed to find a suitable voice to kill");
+    return NULL;
 }
 
 
@@ -5394,8 +5475,10 @@ fluid_synth_alloc_voice_LOCAL(fluid_synth_t *synth, fluid_sample_t *sample, int 
     fluid_channel_t *channel = NULL;
     unsigned int ticks;
 
-    /* check if there's an available voice or kill one */
-    voice = fluid_synth_free_voice_by_kill_LOCAL(synth);
+    /* check if there's an available voice or kill one. Passing the note-on
+     * channel and key lets the stealer prefer replacing an existing voice of
+     * the very same note (retrigger) over stealing a different note. */
+    voice = fluid_synth_free_voice_by_kill_LOCAL(synth, chan, key);
 
     if(voice == NULL)
     {
