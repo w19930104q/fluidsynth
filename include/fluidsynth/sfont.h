@@ -259,6 +259,25 @@ FLUIDSYNTH_API void fluid_sfont_iteration_start(fluid_sfont_t *sfont);
 FLUIDSYNTH_API fluid_preset_t *fluid_sfont_iteration_next(fluid_sfont_t *sfont);
 
 /**
+ * Export a SoundFont as a SoundFont 3 (SF3) file.
+ *
+ * The complete current state of the SoundFont is serialized back to disk:
+ * presets, instruments, zones, generators (including any runtime
+ * modifications), modulators and samples. All samples are compressed as
+ * Ogg Vorbis streams as mandated by the SF3 format.
+ *
+ * @param sfont SoundFont to export (must have been loaded by the default
+ *   SoundFont loader)
+ * @param filename Path of the SF3 file to create
+ * @return #FLUID_OK on success, #FLUID_FAILED otherwise
+ * @since 2.7.0
+ *
+ * @note This function is only available if fluidsynth was compiled with
+ *   libsndfile support (including Ogg Vorbis), otherwise it always fails.
+ */
+FLUIDSYNTH_API int fluid_sfont_export_sf3(fluid_sfont_t *sfont, const char *filename);
+
+/**
  * Method to get a virtual SoundFont preset name.
  *
  * @param preset Virtual SoundFont preset

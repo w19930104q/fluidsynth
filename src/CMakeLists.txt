@@ -140,6 +140,8 @@ set ( libfluidsynth_SOURCES
     sfloader/fluid_sfont.c
     sfloader/fluid_sffile.c
     sfloader/fluid_sffile.h
+    sfloader/fluid_sfwrite.c
+    sfloader/fluid_sfwrite.h
     sfloader/fluid_samplecache.c
     sfloader/fluid_samplecache.h
     rvoice/fluid_adsr_env.c
